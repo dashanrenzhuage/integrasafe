@@ -1,0 +1,167 @@
+node {
+    properties([disableConcurrentBuilds()])
+}
+
+pipeline {
+    agent any
+
+    stages {
+        stage('Quality Check') {
+            steps {
+                //DONT UN-COMMENT THIS LINE! ---> checkout([$class: 'GitSCM', branches: [[name: '*/development']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: '3b5a44e1-2581-42e0-a0bd-ca560982dafd', url: 'https://DarkMoria@bitbucket.org/DarkMoria/multigroupsites.git']]])
+
+                echo '\n\nChecking Code Quality...\n\n'
+                // Copy Workspace Code into Sonarqube Container (for code quality)
+                sh 'sudo docker cp VMI/ sonarqube_server:/home'
+                sh 'sudo docker cp public_html/ sonarqube_server:/home'
+
+                // Move Sonarqube Properties file to publish reports after analysis
+                sh 'sudo docker cp .sonarqube/website/sonar-project.properties sonarqube_server:/home'
+
+                // Allow moved files to be read by Sonarqube's User and remove files that should not be analyzed
+                sh 'sudo docker exec -i sonarqube_server /bin/bash -c "cd /home ; chmod -R 777 * ; rm -rf VMI/_ide_helper.php ; rm -rf VMI/database/ ; rm -rf VMI/bootstrap ; rm -rf VMI/config ; rm -rf VMI/resources/"'
+
+                // Run Sonar Scanner on code and upload the analysis report to Sonarqube_server (configured in Sonarqube's Properties file and Jenkins settings)
+                withSonarQubeEnv('Sonarqube_server') {
+                    sh 'sudo docker exec -i sonarqube_server /bin/bash -c "cd /home ; /opt/sonar-scanner/bin/sonar-scanner"'
+                }
+
+                // Allow time for the report to be fully published
+                sh 'sleep 10'
+                // Check if the Sonar Scanner report failed
+                sh 'cd ../automation_scripts ; python checkSonarqube.py multi-group-sites > check.groovy'
+                load '../automation_scripts/check.groovy'
+            }
+        } //end of Quality Check
+        stage('Spin Up Containers') {
+            steps {
+                echo '\nPassed Quality Check! \nSpinning Up required Containers...\n\n'
+
+                // Start up required Docker Containers (ex. PHP-Apache and MySQL)
+                sh 'sudo docker run -d --name container-mysql -v ~/my.cnf:/my.cnf --net selenium_eeminc_network --ip 172.18.0.252 mysql-plus'
+                sh 'sudo docker run --name container-php-apache -d --link container-mysql --net selenium_eeminc_network --ip 172.18.0.253 php-apache-plus -D foreground'
+
+                // Copy Workspace Repo into PHP Container (for testing)
+                sh 'sudo docker cp . container-php-apache:/var/www/html'
+
+                // Make all files writeable, readable, and executable
+                sh 'sudo docker exec -i container-php-apache /bin/bash -c "cd .. ; chmod -R 777 *"'
+
+                // Make Bootstrap Writeable
+                sh 'sudo docker exec -i container-php-apache /bin/bash -c "cd VMI ; mv .env.pipeline.testing .env; chmod -R 777 bootstrap/cache"'
+
+                echo '\n\nBuilding...\n\n'
+            }
+        } //end of Running Containers
+        stage('Build') {
+            steps {
+                parallel (
+                    "Update Composer" : {
+
+                        // -> Copy cached Vendor files into PHP Container for Composer Update
+                        sh 'sudo docker cp ../cache/vendor container-php-apache:/var/www/html/VMI'
+
+                        // Composer Update
+                        retry(2) {
+                            sh 'sudo docker exec -i container-php-apache /bin/bash -c "cd VMI ; composer self-update --no-plugins ; composer update --no-plugins"'
+                        }
+
+                        // <- Copy Vendor Files back into Jenkins Container (cache/save for future uses)
+                        sh 'sudo docker cp container-php-apache:/var/www/html/VMI/vendor ../cache/'
+                        sh 'chmod -R 777 ../cache/'
+
+                        echo '\nComposer Updated\n'
+                    }, //end of Update Composer
+
+                    "Configure Apache" : {
+
+                        // Copy site configs from repository
+                        sh 'sudo docker exec -i container-php-apache /bin/bash -c "cp dev.*.conf /etc/apache2/sites-available"'
+
+                        //Enable site configs in sites-available
+                        sh 'sudo docker exec -i container-php-apache /bin/bash -c "a2ensite dev.integrasafe.net.conf"'
+
+                        //Prepend hosts definitions to /etc/hosts
+                        sh 'sudo docker exec -i container-php-apache /bin/bash -c "echo \\"172.18.0.253     dev.integrasafe.net\\" >> /etc/hosts"'
+
+                        // Copy SSL Certs for https (-R is recursive)
+                        sh 'sudo docker exec -i container-php-apache /bin/bash -c "cp -v -R ssl /etc/apache2/ssl"'
+
+                        //Enable rewrite and SSL then reload Apache service
+                        sh 'sudo docker exec -i container-php-apache /bin/bash -c "a2enmod rewrite ; a2enmod ssl ; service apache2 reload"'
+                        sh 'sudo docker start container-php-apache'
+
+                        // --- End Apache Config--- //
+                        echo '\nApache Configured\n'
+                    }, //end of "Configure Apache"
+
+                    "Update Databases" : {
+                        // Allow some time for MySQL Container to setup completely (initialize startup Databases)
+                        sh 'sleep 10'
+
+                        // Create initial Database that houses the 'migrations' table for Laravel
+                        retry(2) {
+                            sh 'sudo docker exec -i container-mysql mysql -uroot -e "CREATE DATABASE IF NOT EXISTS database_devvending"'
+                            sh 'sudo docker exec -i container-mysql mysql -uroot -e "CREATE DATABASE IF NOT EXISTS database_multi"'
+                            sh 'sudo docker exec -i container-php-apache /bin/bash -c "cd VMI ; php artisan migrate:install --database=\\"inventory\\""'
+                            sh 'sudo docker exec -i container-php-apache /bin/bash -c "cd VMI ; php artisan migrate:install --database=\\"multi\\""'
+                        }
+                        // Make Dusk Scripts executable and Console Directory for logs
+                        sh 'sudo docker exec -i container-php-apache /bin/bash -c "cd VMI/vendor/laravel/dusk/bin ; chmod 775 *"'
+                        sh 'sudo docker exec -i  container-php-apache /bin/bash -c "cd VMI/tests/Browser ; rm -rf console ; mkdir console"'
+
+                        // Initialize Databases and Run Migrations/Seeders
+                        retry(2) {
+                            sh 'sudo docker exec -i container-php-apache /bin/bash -c "cd VMI ; php artisan migrate ; php artisan db:seed ; php artisan migrate:status"'
+                        }
+
+                        echo '\nDatabase Updated\n'
+                    } //end of "Update Databases"
+                ) //end of Parallel
+
+                // Install and Move Material Design Components
+                //sh 'sudo docker exec -i container-php-apache /bin/bash -c "cd VMI ; gulp migrateMDSource"'
+            }
+        } //end of Build Stage
+        stage('Test') {
+            steps {
+                // Get all the Dusk groups, put them in groups.txt, then format it to remove unwanted characters
+                sh 'sudo docker exec -i container-php-apache /bin/bash -c "cd VMI ; touch groups.txt ; chmod 755 groups.txt ; php artisan dusk --list-groups > groups.txt"'
+                sh 'sudo docker cp container-php-apache:/var/www/html/VMI/groups.txt ../automation_scripts/'
+
+                // Scale up Selenium to handle multiple Browser requests, then
+                // Execute all the *Grouped* Dusk tests, at the exact same time, on different Selenium Nodes with a max retry count of 3 per each. (Some may take longer than others)
+                sh 'cd ../automation_scripts ; python run_dusk.py > run.groovy'
+                load '../automation_scripts/run.groovy'
+            }
+        } //end of Test Stage
+    }
+post {
+    always {
+        // Clean up Sonarqube and Selenium scripts
+        sh 'sudo docker exec -i sonarqube_server /bin/bash -c "cd /home ; rm -rf *"'
+        sh 'cd ../automation_scripts ; sudo rm -rf run.groovy ; sudo rm -rf groups.txt ; sudo rm -rf check.groovy'
+
+        // Removing Selenium Nodes
+        sh 'cd /selenium ; sudo docker-compose up -d --scale selenium-chrome=0'
+
+        // Removing MySQL Container
+        sh 'sudo docker rm -f container-mysql'
+
+        // Removing PHP-Apache Container
+        sh 'sudo docker rm -f container-php-apache'
+
+        // Remove all unused docker volumes
+        sh 'sudo docker volume prune --force'
+
+        // Publish Build Reports
+        //publishHTML([allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true, reportDir: '/reports', reportFiles: 'index.html', reportName: 'HTML Report', reportTitles: ''])
+    }
+    success {
+      echo "\nSUCCESS\n"
+    }
+    failure {
+      echo "\nFAIL. Please correct any errors and try again.\n"
+    }
+  } //end of Post
+} //end of Pipeline

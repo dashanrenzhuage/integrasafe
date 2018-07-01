@@ -1,0 +1,25 @@
+.footerTheme {
+    background: #303131;
+}
+
+.footerTheme hr {
+    border-color: #484a51;
+}
+
+.footerTheme span {
+    color: #8f9196;
+}
+
+.navTheme {
+    background: #fff;
+}
+
+.mdl-navigation .mdl-navigation__link {
+    color: #000;
+}
+
+.mdl-layout__header .mdl-layout__drawer-button {
+    color: #000;
+}
+
+/*# sourceMappingURL=darkGrayTheme.css.map */

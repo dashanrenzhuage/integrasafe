@@ -1,0 +1,150 @@
+node {
+    properties([disableConcurrentBuilds()])
+}
+
+pipeline {
+    agent any
+
+    stages {
+        stage('Quality Check') {
+            steps {
+                //checkout([$class: 'GitSCM', branches: [[name: '*/inSight-app']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: '3b5a44e1-2581-42e0-a0bd-ca560982dafd', url: 'https://DarkMoria@bitbucket.org/DarkMoria/multigroupsites.git']]])
+
+                sh 'sudo docker cp . sonarqube_server:/home'
+
+                // Move Sonarqube Properties file to publish reports after analysis
+                sh 'sudo docker cp sonar/sonar-project.properties sonarqube_server:/home'
+
+                // Allow moved files to be read by Sonarqube's User and remove files that should not be analyzed
+                sh 'sudo docker exec -i sonarqube_server /bin/bash -c "cd /home ; chmod -R 777 *"'
+
+                // Run Sonar Scanner on code and upload the analysis report to Sonarqube_server (configured in Sonarqube's Properties file and Jenkins settings)
+                withSonarQubeEnv('Sonarqube_server') {
+                    sh 'sudo docker exec -i sonarqube_server /bin/bash -c "cd /home ; /opt/sonar-scanner/bin/sonar-scanner"'
+                }
+
+                // Allow time for the report to be fully published
+                sh 'sleep 10'
+                // Check if the Sonar Scanner report failed
+                sh 'cd ../automation_scripts ; python checkSonarqube.py multi-group-apps > check.groovy'
+                load '../automation_scripts/check.groovy'
+            }
+        } //end of Quality Check
+        stage('Spin Up Containers') {
+            steps {
+                // Start up required Docker Containers (ex. Java and MySQL)
+                sh 'sudo docker run -id --name container-java -v /home/otto/jenkins/jobs/apks:/apks -v /home/otto/compose/selenium/android/android-sdk-linux/:/android-sdk-linux --net selenium_eeminc_network --ip 172.18.0.249 java-plus'
+                sh 'sudo docker run -id --name container-python-api --net selenium_eeminc_network --ip 172.18.0.250 pythonapi'
+                sh 'sudo docker run -id --name container-app-mysql -v ~/my.cnf:/my.cnf --net selenium_eeminc_network --ip 172.18.0.251 mysql-plus'
+
+                // Configure Workspace
+                sh 'sudo docker cp . container-java:/home'
+                sh 'sudo docker exec -i container-java /bin/bash -c "cd /home ; chmod -R 775 *"'
+
+                // Move Calabash testing files to /apks volume
+                sh 'sudo docker exec -i container-java /bin/bash -c "cd /home ; mv features/ /apks"'
+            }
+        } //end of Running Containers
+        stage('Build') {
+            steps {
+                parallel (
+                    "Build Database" : {
+                        // Allow Inital Database setup to complete
+                        sh 'sleep 10'
+
+                        // Move SQL Dump file into MySQL container
+                        sh 'sudo docker cp ../cache/databases/. container-app-mysql:/home'
+
+                        // Run Dump file
+                        retry(2) {
+                            sh 'sleep 5'
+                            sh 'sudo docker exec -i container-app-mysql /bin/bash -c "cd /home; mysql < database_dump.sql"'
+                        }
+                    },
+                    "Build AVDs" : {
+                        // Run Android Container with volumes to access APKs and Android Tools
+                        sh 'sudo docker run -id --name android-sdk-21 -v /home/otto/jenkins/jobs/apks/:/home -v /home/otto/compose/selenium/android/android-sdk-linux/:/android-tools --privileged --net selenium_eeminc_network --ip 172.18.0.248 selenium-android'
+
+                        // Build SDK-specific virtual devices
+                        sh 'sudo docker exec -i android-sdk-21 /bin/bash -c "cd /android-sdk-linux ; cp -R * /android-tools"'
+                        sh 'sudo docker exec -i android-sdk-21 /bin/bash -c "cd /android-sdk-linux/tools ; echo \\"no\\" | ./android create avd -n lollipop -t android-21 --abi default/x86_64"'
+                    }
+                )
+            }
+        } //end of Build Stage
+        stage('Compile') {
+            steps {
+                parallel (
+                    'Compile Debug APK' : {
+                        retry(2) {
+                            sh 'sudo docker exec -i container-java /bin/bash -c "cd /home ; ./gradlew assembleDebug"'
+                        }
+
+                        // Move APK and debug signing key to volume for Calabash
+                        sh 'sudo docker exec -i container-java /bin/bash -c "mv /home/app/build/outputs/apk/debug/app-debug.apk /apks"'
+                        sh 'sudo docker exec -i container-java /bin/bash -c "mv ~/.android/debug.keystore /apks"'
+
+                        // Build Calabash test servers
+                        sh 'sudo docker exec -i android-sdk-21 /bin/bash -c "source ~/.bashrc ; cd /home ; bundler exec calabash-android build app-debug.apk"'
+                    },
+                    'Run Emulator(s)' : {
+                        // Start Emulator(s) HERE, allowing for it to be completely booted up by the "Test" Stage (takes about 25-40 seconds)
+                        sh 'sudo docker exec -i android-sdk-21 /bin/bash -c "cd /android-sdk-linux/tools ; ./emulator64-x86 @lollipop -no-window -no-audio &" &'
+                    }
+                )
+            }
+        } //end of Compile Stage
+        stage('Test') {
+            steps {
+                parallel (
+                    "Unit Tests" : {
+                        // Use built-in Java Gradle for testing
+                        sh 'sudo docker exec -i container-java /bin/bash -c "cd /home ; ./gradlew test"'
+                    },
+                    "Calabash Tests": {
+                        // Start ADB Server for Emulators
+                        sh 'sudo docker exec -i android-sdk-21 /bin/bash -c "cd /android-sdk-linux/platform-tools ; ./adb start-server ; ./adb devices"'
+
+                        // Execute Calabash Tests
+                        retry(2) {
+                            sh 'sudo docker exec -i android-sdk-21 /bin/bash -c "source ~/.bashrc ; cd /home ; bundler exec calabash-android run app-debug.apk"'
+                        }
+                    }
+                ) //end of test parallel
+            }
+        } //end of Test Stage
+    }
+post {
+    always {
+        // Clean up Sonarqube scripts and APK directory
+        sh 'sudo docker exec -i sonarqube_server /bin/bash -c "cd /home ; rm -rf *"'
+        sh 'cd ../automation_scripts ; sudo rm -rf check.groovy'
+        sh 'cd ../apks ; rm -rf *'
+
+        // Remove Containers
+        sh 'sudo docker rm -f container-python-api'
+        sh 'sudo docker rm -f container-app-mysql'
+        sh 'sudo docker rm -f android-sdk-21'
+
+        // Remove all unused docker volumes
+        sh 'sudo docker volume prune --force'
+    }
+    success {
+          echo "\nSUCCESS\n"
+
+          // Compile Release APK
+          sh 'sudo docker exec -i container-java /bin/bash -c " cd /home ; ./gradlew assembleRelease"'
+          // Copy Release APK for Jenkins Upload access
+          sh 'sudo docker cp container-java:/home/app/build/outputs/apk/release/app-release.apk .'
+
+          // Remove Java Container
+          sh 'sudo docker rm -f container-java'
+        }
+    failure {
+      echo "\nFAIL. Please correct any errors and try again.\n"
+
+      // Remove Java Container
+      sh 'sudo docker rm -f container-java'
+    }
+  } //end of Post
+} //end of Pipeline
